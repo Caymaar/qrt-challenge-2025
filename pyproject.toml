@@ -1,0 +1,19 @@
+[project]
+name = "qrt-challenge-2025"
+version = "0.1.0"
+description = "https://challengedata.ens.fr/participants/challenges/162/"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "featuretools[complete]>=1.31.0",
+    "graphviz>=0.20.3",
+    "ipykernel>=6.29.5",
+    "lightgbm>=4.5.0",
+    "matplotlib>=3.9.4",
+    "numpy>=2.0.2",
+    "pandas>=2.2.3",
+    "pip>=24.3.1",
+    "scikit-learn>=1.5.2",
+    "scikit-survival>=0.23.1",
+    "setuptools>=75.8.0",
+]
