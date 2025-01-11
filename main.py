@@ -1,14 +1,20 @@
 from src.utilities import create_entity, load_target, predict_and_save
-from src.preprocess import process_categories, process_missing_values
+from src.preprocess import process_categories, process_missing_values, preprocess_caryotype
 import featuretools as ft
+import pandas as pd
 from sksurv.util import Surv
 from sklearn.model_selection import train_test_split
 from sksurv.linear_model import CoxPHSurvivalAnalysis
 from sksurv.metrics import concordance_index_ipcw
 
+# clinical = pd.read_csv(f"data/X_train/clinical_train.csv")
+# X = clinical["CYTOGENETICS"].apply(preprocess_caryotype)
+
+
 train = create_entity('train')
 X, features_defs = ft.dfs(entityset=train, target_dataframe_name="clinical")
-X = process_categories(X, method="del")
+X = process_categories(X, method="dummies")
+X = preprocess_caryotype(X)
 
 test = create_entity('test')
 X_eval, features_defs = ft.dfs(entityset=test, target_dataframe_name="clinical")
