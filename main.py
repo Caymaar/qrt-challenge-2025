@@ -5,17 +5,31 @@ from sksurv.metrics import concordance_index_ipcw
 from sksurv.linear_model import CoxPHSurvivalAnalysis
 import lightgbm as lgb
 
-
-
 data = create_entity()
 
-data = main_preprocess(data)
+# Specify the columns to be processed
+training_size = 0.7
+clinical_process = ["CYTOGENETICS"]
+molecular_process = ["GENE", "EFFECT", "ALT", "REF"]
+merge_process = ["featuretools"]
 
+data = main_preprocess(data, clinical_process, molecular_process, merge_process)
 X, X_eval, y = split_data(data)
+# Check if there are any columns that are not float or int in X
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=(1 - training_size), random_state=42)
 
 X_train, X_test, X_eval = process_missing_values(X_train, X_test, X_eval, method="impute", strategy="median")
+# Ensure all columns in X_train are either float or int
+
+##############################################
+# Define the methods used for training
+##############################################
+
+size_method = f"size_{training_size}"
+clinical_method = "clinical_" + "_".join(clinical_process)
+molecular_method = "molecular_" + "_".join(molecular_process)
+merge_method = "merge_" + "_".join(merge_process)
 
 ##############################################
 # Fit a CoxPH model
@@ -30,9 +44,10 @@ cox_cindex_train = concordance_index_ipcw(y_train, y_train, cox.predict(X_train)
 cox_cindex_test = concordance_index_ipcw(y_train, y_test, cox.predict(X_test), tau=7)[0]
 print(f"Cox Proportional Hazard Model Concordance Index IPCW on train: {cox_cindex_train:.2f}")
 print(f"Cox Proportional Hazard Model Concordance Index IPCW on test: {cox_cindex_test:.2f}")
+cox_score_method = f"score_{cox_cindex_train:.3f}_{cox_cindex_test:.3f}"
 
 # Predict and save the results
-predict_and_save(X_eval, cox, method="featuretools_del_impute_median")
+predict_and_save(X_eval, cox, method=f"{size_method}-{cox_score_method}-{clinical_method}-{molecular_method}-{merge_method}")
 
 ##############################################
 # Fit a LightGBM model
@@ -59,6 +74,7 @@ train_ci_ipcw = concordance_index_ipcw(y_train, y_train, -model.predict(X_train)
 test_ci_ipcw = concordance_index_ipcw(y_train, y_test, -model.predict(X_test), tau=7)[0]
 print(f"LightGBM Survival Model Concordance Index IPCW on train: {train_ci_ipcw:.2f}")
 print(f"LightGBM Survival Model Concordance Index IPCW on test: {test_ci_ipcw:.2f}")
+lightgbm_score_method = f"score_{train_ci_ipcw:.3f}_{test_ci_ipcw:.3f}"
 
 # Predict and save the results
-predict_and_save(X_eval, model, method=f"featuretools_del_impute_median_cyto_processed_depth{lgbm_params['max_depth']}_lr{lgbm_params['learning_rate']}")
+predict_and_save(X_eval, model, method=f"{size_method}-{lightgbm_score_method}-{clinical_method}-{molecular_method}-{merge_method}-{lgbm_params['max_depth']}_lr{lgbm_params['learning_rate']}")
