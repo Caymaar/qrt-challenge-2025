@@ -5,12 +5,18 @@ from sksurv.metrics import concordance_index_ipcw
 from sksurv.linear_model import CoxPHSurvivalAnalysis
 import lightgbm as lgb
 
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 data = create_entity()
 
 # Specify the columns to be processed
 training_size = 0.7
 clinical_process = ["CYTOGENETICS"]
-molecular_process = ["GENE", "EFFECT", "ALT", "REF"]
+molecular_process = ["GENE", "END-START"]
 merge_process = ["featuretools"]
 
 data = main_preprocess(data, clinical_process, molecular_process, merge_process)
@@ -27,9 +33,9 @@ X_train, X_test, X_eval = process_missing_values(X_train, X_test, X_eval, method
 ##############################################
 
 size_method = f"size_{training_size}"
-clinical_method = "clinical_" + "_".join(clinical_process)
-molecular_method = "molecular_" + "_".join(molecular_process)
-merge_method = "merge_" + "_".join(merge_process)
+clinical_method = "clinical_" + "_".join(clinical_process).replace("/", "divby")
+molecular_method = "molecular_" + "_".join(molecular_process).replace("/", "divby")
+merge_method = "merge_" + "_".join(merge_process).replace("/", "divby")
 
 ##############################################
 # Fit a CoxPH model
@@ -47,7 +53,7 @@ print(f"Cox Proportional Hazard Model Concordance Index IPCW on test: {cox_cinde
 cox_score_method = f"score_{cox_cindex_train:.3f}_{cox_cindex_test:.3f}"
 
 # Predict and save the results
-predict_and_save(X_eval, cox, method=f"{size_method}-{cox_score_method}-{clinical_method}-{molecular_method}-{merge_method}")
+predict_and_save(X_eval, cox, method=f"VIF{size_method}-{cox_score_method}-{clinical_method}-{molecular_method}-{merge_method}")
 
 ##############################################
 # Fit a LightGBM model

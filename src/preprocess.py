@@ -15,7 +15,7 @@ def main_preprocess(data, clinical_process, molecular_process, merge_process):
     if "CYTOGENETICS" in clinical_process:
         data['clinical'] = parse_cytogenetics_column(data['clinical'].reset_index(drop=True), column_name='CYTOGENETICS')
 
-    if "featuretools" == merge_process:
+    if "featuretools" in merge_process:
         X, features_defs = ft.dfs(entityset=data, target_dataframe_name="clinical")
     else:
         X = data['clinical'].set_index('ID')
@@ -36,9 +36,28 @@ def main_preprocess(data, clinical_process, molecular_process, merge_process):
         alt = count_bases_per_id(data['molecular'], id_col='ID', ref_col='ALT')
         X = alt.merge(X, left_on='ID', right_index=True, how='right').set_index('ID')
 
-    X = add_ratio_column(X, 'HB', 'PLT')
-    
+    for prcs in clinical_process:
+        if '/' in prcs:
+            num_col, den_col = prcs.split('/')
+            X = add_ratio_column(X, num_col, den_col)
+
+        if '-' in prcs:
+            col_to_soust, col_soust = prcs.split('-')
+            X = add_soustrac_column(X, col_soust, col_to_soust)
+
+    for prcs in molecular_process:
+        if '/' in prcs:
+            num_col, den_col = prcs.split('/')
+            X = add_ratio_column(X, num_col, den_col)
+
+        if '-' in prcs:
+            col_to_soust, col_soust = prcs.split('-')
+            soust = add_soustrac_column(data['molecular'], col_soust, col_to_soust, molecular=True)
+            X = soust.merge(X, left_on='ID', right_index=True, how='right').set_index('ID')
+
     X = process_categories(X, method="del")
+
+    X = X[['gene_ASXL1', 'gene_RUNX1', 'gene_TP53', 'BM_BLAST', 'WBC', 'ANC', 'MONOCYTES', 'HB', 'PLT', 'num_subclones', 'sex', 'total_mitoses', 'num_monosomies', 'num_trisomies', 'complexity_score', 'MAX(molecular.DEPTH)', 'MAX(molecular.END)', 'MEAN(molecular.END)', 'MEAN(molecular.START)', 'MIN(molecular.END)', 'NUM_UNIQUE(molecular.CHR)', 'NUM_UNIQUE(molecular.GENE)', 'SKEW(molecular.DEPTH)', 'STD(molecular.DEPTH)', 'SUM(molecular.VAF)']]
 
     return X
 
@@ -346,5 +365,24 @@ def add_ratio_column(df, col_num, col_den, new_col_name=None):
 
     # On ajoute la série au DataFrame
     df[new_col_name] = ratio_series
+
+    return df
+
+def add_soustrac_column(df, col_soust, col_to_soust, new_col_name=None, molecular=False):
+
+    if new_col_name is None:
+        new_col_name = f"sous_{col_to_soust}_{col_soust}"
+
+    # Copie de sécurité optionnelle (décommentez si vous ne voulez pas modifier le df original)
+    # df = df.copy()
+
+    if molecular:
+        # Pour les lignes valides, on calcule la soustraction
+        df[new_col_name] = df[col_to_soust] - df[col_soust]
+        # On fait un groupby sur "ID" et on calcule la moyenne pour chaque ID
+        df = df.groupby('ID')[new_col_name].mean().reset_index()
+    else:
+        # Pour les lignes valides, on calcule la soustraction
+        df[new_col_name] = df[col_to_soust] - df[col_soust]
 
     return df
