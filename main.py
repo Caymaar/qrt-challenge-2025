@@ -3,21 +3,28 @@ from src.preprocess import process_missing_values, main_preprocess
 from sklearn.model_selection import train_test_split
 from sksurv.metrics import concordance_index_ipcw
 from sksurv.linear_model import CoxPHSurvivalAnalysis
+from sksurv.ensemble import GradientBoostingSurvivalAnalysis
 import lightgbm as lgb
 
 import warnings
+import logging
 
+# Régler le logger de Featuretools au niveau ERROR
+logging.getLogger('featuretools.entityset').setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore",message=".*Ill-conditioned matrix.*")
 
 data = create_entity()
 
 # Specify the columns to be processed
+save = True
+
 training_size = 0.7
-clinical_process = ["CYTOGENETICS"]
-molecular_process = ["GENE", "END-START"]
-merge_process = ["featuretools"]
+clinical_process = ["CYTOGENETICS"] # Possible: ["CYTOGENETICS", "HB/PLT", "logMONOCYTES", "logWBC", "logANC"]
+molecular_process = []#["GENE", "END-START"] # Possible: ["GENE", "EFFECT", "ALT", "REF", "END-START"]
+merge_process = ["gpt"] # Possible: ["featuretools"]
 
 data = main_preprocess(data, clinical_process, molecular_process, merge_process)
 X, X_eval, y = split_data(data)
@@ -53,7 +60,34 @@ print(f"Cox Proportional Hazard Model Concordance Index IPCW on test: {cox_cinde
 cox_score_method = f"score_{cox_cindex_train:.3f}_{cox_cindex_test:.3f}"
 
 # Predict and save the results
-predict_and_save(X_eval, cox, method=f"VIF{size_method}-{cox_score_method}-{clinical_method}-{molecular_method}-{merge_method}")
+if save:
+    predict_and_save(X_eval, cox, method=f"{size_method}-{cox_score_method}-{clinical_method}-{molecular_method}-{merge_method}")
+
+
+##############################################
+# Fit a Gradient Boosting model
+##############################################
+
+xgb_params = {
+    'max_depth': 2,
+    'learning_rate': 0.05,
+    'n_estimators': 200,
+    'subsample': 0.5,
+}
+
+xgb_params_method = "_".join([(str(key) + "=" + str(xgb_params[key])) for key in xgb_params.keys()])
+
+xgb = GradientBoostingSurvivalAnalysis(subsample=xgb_params['subsample'], n_estimators=xgb_params['n_estimators'], learning_rate=xgb_params['learning_rate'], max_depth=xgb_params['max_depth'], random_state=42)
+xgb.fit(X_train, y_train)
+xgb_cindex_train = concordance_index_ipcw(y_train, y_train, xgb.predict(X_train), tau=7)[0]
+xgb_cindex_test = concordance_index_ipcw(y_train, y_test, xgb.predict(X_test), tau=7)[0]
+print(f"Gradient Boosting Survival Model Concordance Index IPCW on train: {xgb_cindex_train:.2f}")
+print(f"Gradient Boosting Survival Model Concordance Index IPCW on test: {xgb_cindex_test:.2f}")
+xgboost_score_method = f"score_{xgb_cindex_train:.3f}_{xgb_cindex_test:.3f}"
+
+if save:
+    predict_and_save(X_eval, xgb, method=f"{size_method}-{xgboost_score_method}-{clinical_method}-{molecular_method}-{merge_method}-{xgb_params_method}")
+
 
 ##############################################
 # Fit a LightGBM model
@@ -63,11 +97,11 @@ predict_and_save(X_eval, cox, method=f"VIF{size_method}-{cox_score_method}-{clin
 lgbm_params = {
     'max_depth': 2,
     'learning_rate': 0.05,
-    'verbose': 1
+    'verbose': 0
 }
 
 X_train_lgb = X_train  # Features for training
-y_train_transformed = y_train['OS_YEARS']
+y_train_transformed = y_train['time']
 
 # Create LightGBM dataset
 train_dataset = lgb.Dataset(X_train_lgb, label=y_train_transformed)
@@ -83,4 +117,5 @@ print(f"LightGBM Survival Model Concordance Index IPCW on test: {test_ci_ipcw:.2
 lightgbm_score_method = f"score_{train_ci_ipcw:.3f}_{test_ci_ipcw:.3f}"
 
 # Predict and save the results
-predict_and_save(X_eval, model, method=f"{size_method}-{lightgbm_score_method}-{clinical_method}-{molecular_method}-{merge_method}-{lgbm_params['max_depth']}_lr{lgbm_params['learning_rate']}")
+if save:
+    predict_and_save(X_eval, model, method=f"{size_method}-{lightgbm_score_method}-{clinical_method}-{molecular_method}-{merge_method}-{lgbm_params['max_depth']}_lr{lgbm_params['learning_rate']}")

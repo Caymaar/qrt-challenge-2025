@@ -54,7 +54,10 @@ def split_data(X_data):
 
     # Create the survival data format
     X_data = X_data.loc[X_data.index.isin(target['ID'])]
-    y = Surv.from_dataframe('OS_STATUS', 'OS_YEARS', target)
+
+    #Rename columns of target
+    target.rename(columns={'OS_STATUS': 'event', 'OS_YEARS': 'time'}, inplace=True)
+    y = Surv.from_dataframe('event', 'time', target)
 
     return X_data, X_eval, y
 

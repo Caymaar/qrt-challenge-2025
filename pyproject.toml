@@ -5,6 +5,7 @@ description = "https://challengedata.ens.fr/participants/challenges/162/"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
+    "autoviz>=0.1.905",
     "featuretools[complete]>=1.31.0",
     "graphviz>=0.20.3",
     "ipykernel>=6.29.5",

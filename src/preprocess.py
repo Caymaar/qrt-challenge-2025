@@ -17,6 +17,9 @@ def main_preprocess(data, clinical_process, molecular_process, merge_process):
 
     if "featuretools" in merge_process:
         X, features_defs = ft.dfs(entityset=data, target_dataframe_name="clinical")
+    elif "gpt" in merge_process:
+        data['molecular'] = preprocess_mutation_data(data['molecular'])
+        X = data['clinical'].merge(data['molecular'], left_on='ID', right_on='ID', how='left').set_index('ID')
     else:
         X = data['clinical'].set_index('ID')
 
@@ -45,6 +48,17 @@ def main_preprocess(data, clinical_process, molecular_process, merge_process):
             col_to_soust, col_soust = prcs.split('-')
             X = add_soustrac_column(X, col_soust, col_to_soust)
 
+        if 'log' in prcs:
+            col = prcs.split('log')[1]
+            X[prcs] = np.log(X[col]+1)
+            X.drop(col, axis=1, inplace=True)
+
+        if '<' in prcs:
+            print(prcs)
+            col1, col2 = prcs.split('<')
+            X[prcs] = (X[col1] < X[col2]).astype(int)
+
+
     for prcs in molecular_process:
         if '/' in prcs:
             num_col, den_col = prcs.split('/')
@@ -56,8 +70,6 @@ def main_preprocess(data, clinical_process, molecular_process, merge_process):
             X = soust.merge(X, left_on='ID', right_index=True, how='right').set_index('ID')
 
     X = process_categories(X, method="del")
-
-    X = X[['gene_ASXL1', 'gene_RUNX1', 'gene_TP53', 'BM_BLAST', 'WBC', 'ANC', 'MONOCYTES', 'HB', 'PLT', 'num_subclones', 'sex', 'total_mitoses', 'num_monosomies', 'num_trisomies', 'complexity_score', 'MAX(molecular.DEPTH)', 'MAX(molecular.END)', 'MEAN(molecular.END)', 'MEAN(molecular.START)', 'MIN(molecular.END)', 'NUM_UNIQUE(molecular.CHR)', 'NUM_UNIQUE(molecular.GENE)', 'SKEW(molecular.DEPTH)', 'STD(molecular.DEPTH)', 'SUM(molecular.VAF)']]
 
     return X
 
@@ -179,7 +191,7 @@ def parse_cytogenetics(cyto_str):
 
     return {
         'num_subclones': num_subclones,
-        'sex': sex if sex else -1,
+        'sex': sex if sex is not None else 0.5,
         'avg_chromosomes': avg_chromosomes,
         'total_mitoses': total_mitoses,
         'num_translocations': total_translocations,
@@ -206,8 +218,6 @@ def parse_cytogenetics_column(df, column_name='CYTOGENETICS'):
     # Concaténer avec le DataFrame d'origine (sans dupliquer la colonne de base si vous voulez la garder)
     # Si vous préférez garder la colonne CYTOGENETICS, ne la supprimez pas.
     final_df = pd.concat([df.drop(columns=[column_name]), parsed_df], axis=1)
-
-    final_df['sex'].fillna(0, inplace=True)
 
     return final_df
 
@@ -380,9 +390,166 @@ def add_soustrac_column(df, col_soust, col_to_soust, new_col_name=None, molecula
         # Pour les lignes valides, on calcule la soustraction
         df[new_col_name] = df[col_to_soust] - df[col_soust]
         # On fait un groupby sur "ID" et on calcule la moyenne pour chaque ID
-        df = df.groupby('ID')[new_col_name].mean().reset_index()
+        df = df.groupby('ID')[new_col_name].sum().reset_index()
     else:
         # Pour les lignes valides, on calcule la soustraction
         df[new_col_name] = df[col_to_soust] - df[col_soust]
+
+    return df
+
+def log_add_one(df, col):
+    """
+    Ajoute 1 à toutes les valeurs de la colonne `col` du DataFrame `df`,
+    puis applique le logarithme naturel à chaque valeur.
+    
+    Paramètres
+    ----------
+    df : pd.DataFrame
+        Le DataFrame contenant la colonne à transformer.
+    col : str
+        Nom de la colonne à transformer.
+    
+    Retour
+    ------
+    pd.Series
+        La colonne transformée.
+    """
+    return np.log(df[col]+1)
+
+
+def preprocess_mutation_data(df_mutations: pd.DataFrame) -> pd.DataFrame:
+    """
+    df_mutations : DataFrame contenant les colonnes
+        [ID, CHR, START, END, REF, ALT, GENE, PROTEIN_CHANGE, EFFECT, VAF, DEPTH]
+    Retourne : Un DataFrame agrégé au niveau du patient, avec des features pour le modèle de survie.
+    """
+
+    # -- Étape 1 : création de variables binaires/catégorielles à partir d'EFFECT --
+    df_mutations = encode_effect(df_mutations)
+
+    # -- Étape 2 : sélection ou transformation d'autres colonnes (CHR, PROTEIN_CHANGE, etc.) --
+    # ex. encoder le chromosome, calculer une taille d'indel si besoin, etc.
+    df_mutations = transform_other_cols(df_mutations)
+
+    # -- Étape 3 : agrégation par ID patient --
+    df_agg = aggregate_by_patient(df_mutations)
+
+    # -- Étape 4 : (optionnel) normalisation ou filtrage si nécessaire --
+    df_agg = normalize_features(df_agg)
+
+    return df_agg
+
+
+def encode_effect(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Crée des colonnes binaires ou catégorielles à partir de la colonne EFFECT :
+    - stop_gained, frameshift_variant, splice_site_variant, non_synonymous_codon, etc.
+    """
+    # Exemple : variable binaire "is_truncating" pour frameshift + stop_gained
+    truncating_effects = ["stop_gained", "frameshift_variant"]
+    df["is_truncating"] = df["EFFECT"].isin(truncating_effects).astype(int)
+
+    # Autres exemples : non_synonymous, splice_site, ...
+    df["is_non_synonymous"] = (df["EFFECT"] == "non_synonymous_codon").astype(int)
+    df["is_splice_site"] = (df["EFFECT"] == "splice_site_variant").astype(int)
+
+    # Vous pouvez multiplier ce genre de mapping en fonction de votre usage
+    return df
+
+
+def transform_other_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Traite d'autres colonnes comme CHR, PROTEIN_CHANGE, etc.
+    """
+    # (1) Encoder le chromosome de manière catégorielle (CHR = 1, 2, 3, X, etc.)
+    #     => Soit on convertit en "chr1, chr2, ..." ou on mappe X, Y en 23, 24...
+    df["CHR"] = df["CHR"].astype(str)  # s'assure que c'est du string
+    # Exemple de map "X" -> 23, "Y" -> 24 si vous préférez en numérique
+    chr_map = {"X": "23", "Y": "24"}  # ou faire l'inverse : "23"->"X" si besoin
+    df["CHR"] = df["CHR"].replace(chr_map)
+    # Optionnel : on peut laisser CHR en string et faire un one-hot encoding plus tard
+
+    # (2) Calculer la "taille" de la mutation (END - START + 1) si c'est un indel
+    df["mut_length"] = (df["END"] - df["START"] + 1).fillna(0).astype(int)
+
+    # (3) Extraire la position d'aa impactée depuis PROTEIN_CHANGE si format "p.E545K"
+    #     => p.E545K => on veut la position 545
+    #     On peut faire une regex simple : p.([A-Z])(\d+)([A-Z*])
+    import re
+    def extract_aa_position(prot_change):
+        # Prot_change type "p.E545K" -> renvoie 545 (int)
+        if not isinstance(prot_change, str):
+            return None
+        match = re.match(r"p\.[A-Z](\d+).*", prot_change)
+        if match:
+            return int(match.group(1))
+        return None
+
+    df["AA_position"] = df["PROTEIN_CHANGE"].apply(extract_aa_position)
+
+    return df
+
+
+def aggregate_by_patient(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Agrège les mutations par ID patient pour obtenir un set de features complet.
+    Exemple de features :
+        - total_mutations
+        - mean_vaf, max_vaf
+        - nb_truncating
+        - nb_non_synonymous
+        - nb_unique_genes
+        ...
+    """
+
+    agg_dict = {
+        "VAF": ["mean", "max", "min", "std"],
+        "is_truncating": "sum",         # nombre de variants truncants
+        "is_non_synonymous": "sum",     # nombre de variants non-synonymes
+        "is_splice_site": "sum",        # ...
+        "mut_length": ["mean", "max"],  # taille moyenne d'indel, ...
+        # etc.
+    }
+
+    # On veut aussi compter le nombre total de mutations, 
+    # donc on peut ajouter une colonne dummy pour compter
+    df["count_mut"] = 1
+
+    # On agrège
+    df_agg = df.groupby("ID").agg(agg_dict)
+
+    # Flatten les multi-index de colonnes
+    df_agg.columns = ["_".join(col).strip() for col in df_agg.columns.values]
+
+    # Nombre total de mutations
+    df_agg["total_mutations"] = df.groupby("ID")["count_mut"].sum()
+
+    # Nombre de gènes distincts
+    df_agg["unique_genes"] = df.groupby("ID")["GENE"].nunique()
+
+    # Autres features, ex. fraction de mutations avec VAF > 0.3
+    df_agg["frac_vaf_gt_0_3"] = df.groupby("ID").apply(
+        lambda group: (group["VAF"] > 0.3).mean()
+    )
+
+    df_agg = df_agg.reset_index()
+
+    return df_agg
+
+
+def normalize_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Optionnel : normaliser ou standardiser certaines features continues.
+    """
+    from sklearn.preprocessing import StandardScaler
+
+    # Sélection des colonnes à normaliser (exclure ID, etc.)
+    cols_to_scale = [
+        c for c in df.columns 
+        if c not in ["ID"]  # On garde ID intact
+    ]
+
+    scaler = StandardScaler()
+    df[cols_to_scale] = scaler.fit_transform(df[cols_to_scale])
 
     return df
