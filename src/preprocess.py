@@ -3,33 +3,112 @@ import numpy as np
 from sklearn.impute import SimpleImputer
 import featuretools as ft
 import re
-from src.utilities import create_entity
+import json
+import math
+from tensorflow.keras.layers import Input, Embedding, Flatten
+from tensorflow.keras.models import Model
 
-def main_preprocess(data, clinical_process, molecular_process, merge_process):
+def create_entity(params):
 
+    clinical_train = pd.read_csv("data/X_train/clinical_train.csv")
+    molecular_train = pd.read_csv("data/X_train/molecular_train.csv")
+
+    clinical_test = pd.read_csv("data/X_test/clinical_test.csv")
+    molecular_test = pd.read_csv("data/X_test/molecular_test.csv")
+
+    clinical = pd.concat([clinical_train, clinical_test]).reset_index(drop=True)
+    molecular = pd.concat([molecular_train, molecular_test]).reset_index(drop=True)
+
+    additional_list = params.get('additional', [])
+    molecular = add_myvariant_data(molecular, additional_list)
+
+
+    es = ft.EntitySet(id="data")
+
+    es = es.add_dataframe(
+        dataframe_name='clinical',
+        dataframe=clinical,
+        index='ID' 
+    )
+
+    es = es.add_dataframe(
+        dataframe_name='molecular',
+        dataframe=molecular,
+        index='index'   
+    )
+
+    es.add_relationship(
+        parent_dataframe_name='clinical',
+        parent_column_name='ID',
+        child_dataframe_name='molecular',
+        child_column_name='ID'
+    )
+
+    return es
+
+def main_preprocess(data, params):
+
+    clinical_process = params.get('clinical', [])
+    molecular_process = params.get('molecular', [])
+    merge_process = params.get('merge', [])
     # data = create_entity()
     # clinical_process = ["CYTOGENETICS"]
     # molecular_process = ["GENE"]
     # merge_process = "featureto"
 
+    found = False
+
     if "CYTOGENETICS" in clinical_process:
         data['clinical'] = parse_cytogenetics_column(data['clinical'].reset_index(drop=True), column_name='CYTOGENETICS')
+    
+    elif "CYTOGENETICSv2" in clinical_process:
+        data['clinical'] = parse_cytogenetics_column_v2(data['clinical'].reset_index(drop=True), column_name='CYTOGENETICS')
+
+    elif "CYTOGENETICSv3" in clinical_process:
+        data['clinical'] = parse_cytogenetics_column_v3(data['clinical'].reset_index(drop=True), column_name='CYTOGENETICS')
+
+    elif "CYTOGENETICSv4" in clinical_process:
+        data['clinical'] = parse_cytogenetics_column_v4(data['clinical'].reset_index(drop=True), column_name='CYTOGENETICS')
+
+    else:
+        data['clinical'] = data['clinical'].drop(columns=['CYTOGENETICS'])
+
+    if "CENTER" in clinical_process:
+        data['clinical'] = create_one_hot(data['clinical'], id_col='ID', ref_col='CENTER', min_count=0, rare_label='gene_other')
+
+
+
 
     if "featuretools" in merge_process:
         X, features_defs = ft.dfs(entityset=data, target_dataframe_name="clinical")
-    elif "gpt" in merge_process:
-        data['molecular'] = preprocess_mutation_data(data['molecular'])
-        X = data['clinical'].merge(data['molecular'], left_on='ID', right_on='ID', how='left').set_index('ID')
+        found = True
     else:
+        X = None
+    
+    if "gpt" in merge_process:
+        gpt = preprocess_mutation_data(data['molecular'])
+        if X is None:
+            X = data['clinical'].set_index('ID')
+
+        X = gpt.merge(X, left_on='ID', right_index=True, how='right').set_index('ID')
+        found = True
+    
+    if not found:
         X = data['clinical'].set_index('ID')
 
     if "GENE" in molecular_process:
+        #gene_emb = create_embedding_features(data['molecular'], id_col='ID', ref_col='GENE', embedding_dim=16, min_count=50, rare_label='gene_other')
         gene = create_one_hot(data['molecular'], id_col='ID', ref_col='GENE', min_count=50, rare_label='gene_other')
+        #X = gene_emb.merge(X, left_index=True, right_index=True, how='right')
         X = gene.merge(X, left_on='ID', right_index=True, how='right').set_index('ID')
 
     if "EFFECT" in molecular_process:
-        effect = create_one_hot(data['molecular'], id_col='ID', ref_col='EFFECT', min_count=0, rare_label='effect_other')
+        effect = create_one_hot(data['molecular'], id_col='ID', ref_col='EFFECT', min_count=20, rare_label='effect_other')
         X = effect.merge(X, left_on='ID', right_index=True, how='right').set_index('ID')
+
+    if "CHR" in molecular_process:
+        chr = create_one_hot(data['molecular'], id_col='ID', ref_col='CHR', min_count=0, rare_label='chr_other')
+        X = chr.merge(X, left_on='ID', right_index=True, how='right').set_index('ID')
 
     if "REF" in molecular_process:
         ref = count_bases_per_id(data['molecular'], id_col='ID', ref_col='REF')
@@ -57,6 +136,14 @@ def main_preprocess(data, clinical_process, molecular_process, merge_process):
             print(prcs)
             col1, col2 = prcs.split('<')
             X[prcs] = (X[col1] < X[col2]).astype(int)
+
+        if '+' in prcs:
+            col1, col2 = prcs.split('+')
+            X[prcs] = X[col1] + X[col2]
+
+        if '*' in prcs:
+            col1, col2 = prcs.split('*')
+            X[prcs] = X[col1] * X[col2]
 
 
     for prcs in molecular_process:
@@ -221,6 +308,455 @@ def parse_cytogenetics_column(df, column_name='CYTOGENETICS'):
 
     return final_df
 
+def parse_cytogenetics_v2(cyto_str):
+    """
+    Parse une chaîne cytogénétique au format ISCN standard et en extrait des features.
+    
+    La méthode fonctionne de la façon suivante :
+      1. Si la chaîne est manquante ou vide, on retourne des valeurs par défaut.
+      2. On vérifie si la chaîne contient le mot "complex" (indicateur d'un caryotype complexe).
+      3. On divise la chaîne en sous-clones en utilisant le séparateur '/'.
+      4. Pour chaque sous-clone, on extrait le nombre de cellules (la valeur entre crochets)
+         et on traite chaque partie séparée par des virgules.
+      5. On récupère :
+         - Le nombre de chromosomes indiqué en première position (si présent).
+         - Le sexe (si "xy" ou "xx" est présent) en pondérant selon le nombre de cellules.
+         - Les anomalies (translocations, délétions, inversions, duplications, additions)
+           via des expressions régulières.
+         - Les anomalies numériques (trisomies et monosomies) en recherchant des patterns
+           du type "+num" ou "-num".
+      6. On calcule ensuite :
+         - La moyenne pondérée du nombre de chromosomes.
+         - Un score de complexité égal à la somme des anomalies structurelles détectées.
+         - Le nombre total de mitoses (somme des nombres entre crochets).
+    
+    Retourne un dictionnaire contenant toutes ces features.
+    """
+    
+    # Cas particulier : valeur manquante ou chaîne vide
+    if pd.isna(cyto_str) or not isinstance(cyto_str, str) or cyto_str.strip() == "":
+        return {
+            'num_subclones': 0, 'sex': 0.5, 'avg_chromosomes': None,
+            'total_mitoses': 0, 'num_translocations': 0, 'num_deletions': 0,
+            'num_inversions': 0, 'num_duplications': 0, 'num_additions': 0,
+            'num_monosomies': 0, 'num_trisomies': 0, 'complexity_score': 0,
+            'complex_flag': False
+        }
+    
+    # Vérification du flag "complex"
+    is_complex = 'complex' in cyto_str.lower()
+
+    # Séparation en sous-clones (le séparateur est "/")
+    subclones = cyto_str.split('/')
+    
+    # Initialisation des compteurs (en pondérant par le nombre de cellules de chaque clone)
+    total_mitoses      = 0
+    total_translocations = 0
+    total_deletions      = 0
+    total_inversions     = 0
+    total_duplications   = 0
+    total_additions      = 0
+    total_monosomies     = 0
+    total_trisomies      = 0
+
+    # Pour la moyenne pondérée du nombre de chromosomes
+    sum_chromosomes  = 0
+    count_chromosomes = 0
+
+    # Comptage pour déterminer le sexe (on considère "xy" comme masculin et "xx" comme féminin)
+    sex_counts = {'xy': 0, 'xx': 0}
+
+    for clone in subclones:
+        # Recherche du nombre de cellules dans [x] (poids du clone)
+        mitosis_match = re.search(r'\[(\d+)\]', clone)
+        clone_weight = int(mitosis_match.group(1)) if mitosis_match else 1
+        total_mitoses += clone_weight
+
+        # On retire la partie "[x]" pour faciliter le parsing
+        clone_clean = re.sub(r'\[\d+\]', '', clone)
+        # Découpage par virgule
+        parts = [p.strip() for p in clone_clean.split(',') if p.strip()]
+
+        # La première partie est généralement le nombre de chromosomes
+        if parts and re.match(r'^\d+$', parts[0]):
+            try:
+                chrom_count = int(parts[0])
+                sum_chromosomes += chrom_count * clone_weight
+                count_chromosomes += clone_weight
+            except Exception:
+                pass
+
+        # Analyse de chaque partie pour détecter les anomalies
+        for part in parts:
+            part_lower = part.lower()
+
+            # Détection du sexe
+            if 'xy' in part_lower:
+                sex_counts['xy'] += clone_weight
+            elif 'xx' in part_lower:
+                sex_counts['xx'] += clone_weight
+
+            # Comptage des anomalies structurelles avec des expressions régulières :
+            # Translocations : ex: t(3;3)
+            trans_matches = re.findall(r't\(\d+;\d+\)', part_lower)
+            total_translocations += len(trans_matches) * clone_weight
+
+            # Délétions : ex: del(3)(q26q27)
+            del_matches = re.findall(r'del\([^)]*\)', part_lower)
+            total_deletions += len(del_matches) * clone_weight
+
+            # Inversions : ex: inv(3)(p21q27)
+            inv_matches = re.findall(r'inv\([^)]*\)', part_lower)
+            total_inversions += len(inv_matches) * clone_weight
+
+            # Duplications : ex: dup(3)(q21q26)
+            dup_matches = re.findall(r'dup\([^)]*\)', part_lower)
+            total_duplications += len(dup_matches) * clone_weight
+
+            # Additions : ex: add(5)(q31)
+            add_matches = re.findall(r'add\([^)]*\)', part_lower)
+            total_additions += len(add_matches) * clone_weight
+
+            # Comptage des anomalies numériques (monosomies et trisomies)
+            monosomy_matches = re.findall(r'(?<![a-zA-Z\(])\-\d+', part_lower)
+            total_monosomies += len(monosomy_matches) * clone_weight
+
+            trisomy_matches = re.findall(r'\+\d+', part_lower)
+            total_trisomies += len(trisomy_matches) * clone_weight
+
+    # Calcul de la moyenne pondérée du nombre de chromosomes
+    avg_chromosomes = sum_chromosomes / count_chromosomes if count_chromosomes > 0 else None
+
+    # Calcul du "complexity_score" en sommant les anomalies structurelles
+    complexity_score = total_translocations + total_deletions + total_inversions + total_duplications + total_additions
+
+    # Détermination du sexe majoritaire (1.0 pour masculin, 0.0 pour féminin, 0.5 si indéterminé ou mixte)
+    if sex_counts['xy'] > sex_counts['xx']:
+        sex = 1.0
+    elif sex_counts['xy'] < sex_counts['xx']:
+        sex = 0.0
+    else:
+        sex = 0.5
+
+    return {
+        'num_subclones': len(subclones),
+        'sex': sex,
+        'avg_chromosomes': avg_chromosomes,
+        'total_mitoses': total_mitoses,
+        'num_translocations': total_translocations,
+        'num_deletions': total_deletions,
+        'num_inversions': total_inversions,
+        'num_duplications': total_duplications,
+        'num_additions': total_additions,
+        'num_monosomies': total_monosomies,
+        'num_trisomies': total_trisomies,
+        'complexity_score': complexity_score,
+        'complex_flag': is_complex
+    }
+
+def parse_cytogenetics_column_v2(df, column_name='CYTOGENETICS'):
+    """
+    Applique la fonction parse_cytogenetics à chaque ligne de la colonne spécifiée du DataFrame.
+    
+    Retourne un nouveau DataFrame qui contient à la fois les données d'origine
+    et les features extraites.
+    """
+    # Applique la fonction à chaque valeur de la colonne
+    parsed_series = df[column_name].apply(parse_cytogenetics_v2)
+    # Transforme la série de dictionnaires en DataFrame
+    parsed_df = pd.json_normalize(parsed_series)
+    # Concatène avec le DataFrame d'origine (vous pouvez garder ou supprimer la colonne initiale)
+    final_df = pd.concat([df.drop(columns=[column_name]), parsed_df], axis=1)
+    return final_df
+
+def parse_cytogenetics_v3(cyto_str):
+    """
+    Transforme une chaîne ISCN (ex: "46,xy,del(3)(q26q27)[15]/46,xy[5]") 
+    en un dictionnaire de features exploitables pour la prédiction.
+    
+    L'output comprend notamment :
+      - num_subclones : nombre de sous-clones détectés
+      - sex : 1.0 pour masculin, 0.0 pour féminin, 0.5 si ambigu
+      - avg_chromosomes : moyenne (non pondérée) du nombre de chromosomes
+      - total_mitoses : somme des nombres entre crochets
+      - num_translocations, num_deletions, num_inversions, num_duplications, num_additions
+      - num_monosomies, num_trisomies
+      - complexity_score : somme des anomalies structurelles
+      - complex_flag : True si "complex" est présent dans la chaîne
+      - mosaicism_index : indice de diversité clonale (0 si un seul clone)
+    """
+    # Cas où la donnée est manquante ou vide
+    if pd.isna(cyto_str) or not isinstance(cyto_str, str) or cyto_str.strip() == "":
+        return {
+            'num_subclones': 0, 'sex': 0.5, 'avg_chromosomes': None,
+            'total_mitoses': 0, 'num_translocations': 0, 'num_deletions': 0,
+            'num_inversions': 0, 'num_duplications': 0, 'num_additions': 0,
+            'num_monosomies': 0, 'num_trisomies': 0, 'complexity_score': 0,
+            'complex_flag': False, 'mosaicism_index': 0
+        }
+    
+    # Vérifier si le terme "complex" est présent dans la chaîne (flag qualitatif)
+    complex_flag = 'complex' in cyto_str.lower()
+    
+    # Séparer la chaîne en sous-clones (le séparateur est "/")
+    clones = cyto_str.split('/')
+    num_subclones = len(clones)
+    
+    # Initialisation des compteurs globaux
+    total_mitoses = 0
+    clone_chromosome_numbers = []  # pour calculer la moyenne des chromosomes
+    clone_weights = []             # pour calculer la diversité clonale
+    total_translocations = 0
+    total_deletions = 0
+    total_inversions = 0
+    total_duplications = 0
+    total_additions = 0
+    total_monosomies = 0
+    total_trisomies = 0
+    sex_counts = {'xy': 0, 'xx': 0}
+    
+    # Parcours de chaque clone
+    for clone in clones:
+        clone_str = clone.strip().lower()
+        # Extraction du nombre de mitoses (poids du clone) via [x]
+        mitosis_match = re.search(r'\[(\d+)\]', clone_str)
+        weight = int(mitosis_match.group(1)) if mitosis_match else 1
+        clone_weights.append(weight)
+        total_mitoses += weight
+        
+        # Retirer la partie [x] pour faciliter le parsing
+        clone_clean = re.sub(r'\[\d+\]', '', clone_str)
+        parts = [p.strip() for p in clone_clean.split(',') if p.strip()]
+        
+        for p in parts:
+            # Si la partie est uniquement numérique, elle correspond au nombre de chromosomes
+            if re.match(r'^\d+$', p):
+                try:
+                    clone_chromosome_numbers.append(int(p))
+                except:
+                    pass
+            
+            # Détection du sexe
+            if 'xy' in p:
+                sex_counts['xy'] += weight
+            elif 'xx' in p:
+                sex_counts['xx'] += weight
+                
+            # Comptage des anomalies structurelles
+            if re.search(r't\(\d+;\d+\)', p):
+                total_translocations += 1 * weight
+            if 'del(' in p:
+                total_deletions += 1 * weight
+            if 'inv(' in p:
+                total_inversions += 1 * weight
+            if 'dup(' in p:
+                total_duplications += 1 * weight
+            if 'add(' in p:
+                total_additions += 1 * weight
+                
+            # Comptage des anomalies numériques (ex: +7 ou -5)
+            if re.search(r'\+\d+', p):
+                total_trisomies += 1 * weight
+            if re.search(r'\-\d+', p):
+                total_monosomies += 1 * weight
+    
+    # Calcul de la moyenne (non pondérée) du nombre de chromosomes
+    avg_chromosomes = (sum(clone_chromosome_numbers) / len(clone_chromosome_numbers)
+                       if clone_chromosome_numbers else 46)
+    
+    # Score de complexité = somme des anomalies structurelles
+    complexity_score = (total_translocations + total_deletions + total_inversions +
+                        total_duplications + total_additions)
+    
+    # Détermination du sexe : on privilégie le type majoritaire
+    if sex_counts['xy'] > sex_counts['xx']:
+        sex = 1.0
+    elif sex_counts['xx'] > sex_counts['xy']:
+        sex = 0.0
+    else:
+        sex = 0.5
+    
+    # Calcul d'un indice de mosaicisme à partir des poids clonaux
+    # Ici, on utilise l'entropie de Shannon normalisée pour quantifier la diversité
+    if total_mitoses > 0 and len(clone_weights) > 1:
+        entropy = -sum((w / total_mitoses) * math.log(w / total_mitoses) for w in clone_weights if w > 0)
+        # Normalisation par log(num_subclones) pour obtenir une valeur entre 0 et 1
+        mosaicism_index = entropy / math.log(num_subclones) if num_subclones > 1 else 0
+    else:
+        mosaicism_index = 0
+    
+    return {
+        'num_subclones': num_subclones,
+        'sex': sex,
+        'avg_chromosomes': avg_chromosomes,
+        'total_mitoses': total_mitoses,
+        'num_translocations': total_translocations,
+        'num_deletions': total_deletions,
+        'num_inversions': total_inversions,
+        'num_duplications': total_duplications,
+        'num_additions': total_additions,
+        'num_monosomies': total_monosomies,
+        'num_trisomies': total_trisomies,
+        'complexity_score': complexity_score,
+        'complex_flag': complex_flag,
+        'mosaicism_index': mosaicism_index
+    }
+
+def parse_cytogenetics_column_v3(df, column_name='CYTOGENETICS'):
+    """
+    Applique la fonction parse_cytogenetics à chaque ligne de la colonne indiquée
+    et retourne un nouveau DataFrame comprenant les features extraites.
+    """
+    parsed_series = df[column_name].apply(parse_cytogenetics_v3)
+    parsed_df = pd.json_normalize(parsed_series)
+    final_df = pd.concat([df.drop(columns=[column_name]), parsed_df], axis=1)
+    return final_df
+
+def parse_cytogenetics_v4(cyto_str):
+    """
+    Transforme une chaîne ISCN (ex: "46,xy,del(3)(q26q27)[15]/46,xy[5]") 
+    en un dictionnaire de features exploitables pour la prédiction.
+    
+    L'output comprend notamment :
+      - num_subclones : nombre de sous-clones détectés
+      - sex : 1.0 pour masculin, 0.0 pour féminin, 0.5 si ambigu
+      - avg_chromosomes : moyenne (non pondérée) du nombre de chromosomes
+      - total_mitoses : somme des nombres entre crochets
+      - num_translocations, num_deletions, num_inversions, num_duplications, num_additions
+      - num_monosomies, num_trisomies
+      - complexity_score : somme des anomalies structurelles
+      - complex_flag : True si "complex" est présent dans la chaîne
+      - mosaicism_index : indice de diversité clonale (0 si un seul clone)
+    """
+    # Cas où la donnée est manquante ou vide
+    if pd.isna(cyto_str) or not isinstance(cyto_str, str) or cyto_str.strip() == "":
+        return {
+            'num_subclones': 0, 'sex': 0.5, 'avg_chromosomes': None,
+            'total_mitoses': 0, 'num_translocations': 0, 'num_deletions': 0,
+            'num_inversions': 0, 'num_duplications': 0, 'num_additions': 0,
+            'num_monosomies': 0, 'num_trisomies': 0, 'complexity_score': 0,
+            'complex_flag': False, 'mosaicism_index': 0
+        }
+    
+    # Vérifier si le terme "complex" est présent dans la chaîne (flag qualitatif)
+    complex_flag = 'complex' in cyto_str.lower()
+    
+    # Séparer la chaîne en sous-clones (le séparateur est "/")
+    clones = cyto_str.split('/')
+    num_subclones = len(clones)
+    
+    # Initialisation des compteurs globaux
+    total_mitoses = 0
+    clone_chromosome_numbers = []  # pour calculer la moyenne des chromosomes
+    clone_weights = []             # pour calculer la diversité clonale
+    total_translocations = 0
+    total_deletions = 0
+    total_inversions = 0
+    total_duplications = 0
+    total_additions = 0
+    total_monosomies = 0
+    total_trisomies = 0
+    sex_counts = {'xy': 0, 'xx': 0}
+    
+    # Parcours de chaque clone
+    for clone in clones:
+        clone_str = clone.strip().lower()
+        # Extraction du nombre de mitoses (poids du clone) via [x]
+        mitosis_match = re.search(r'\[(\d+)\]', clone_str)
+        weight = int(mitosis_match.group(1)) if mitosis_match else 1
+        clone_weights.append(weight)
+        total_mitoses += weight
+        
+        # Retirer la partie [x] pour faciliter le parsing
+        clone_clean = re.sub(r'\[\d+\]', '', clone_str)
+        parts = [p.strip() for p in clone_clean.split(',') if p.strip()]
+        
+        for p in parts:
+            # Si la partie est uniquement numérique, elle correspond au nombre de chromosomes
+            if re.match(r'^\d+$', p):
+                try:
+                    clone_chromosome_numbers.append(int(p))
+                except:
+                    pass
+
+            weight = 1
+            
+            # Détection du sexe
+            if 'xy' in p:
+                sex_counts['xy'] += weight
+            elif 'xx' in p:
+                sex_counts['xx'] += weight
+                
+            # Comptage des anomalies structurelles
+            if re.search(r't\(\d+;\d+\)', p):
+                total_translocations += 1 * weight
+            if 'del(' in p:
+                total_deletions += 1 * weight
+            if 'inv(' in p:
+                total_inversions += 1 * weight
+            if 'dup(' in p:
+                total_duplications += 1 * weight
+            if 'add(' in p:
+                total_additions += 1 * weight
+                
+            # Comptage des anomalies numériques (ex: +7 ou -5)
+            if re.search(r'\+\d+', p):
+                total_trisomies += 1 * weight
+            if re.search(r'\-\d+', p):
+                total_monosomies += 1 * weight
+    
+    # Calcul de la moyenne (non pondérée) du nombre de chromosomes
+    avg_chromosomes = (sum(clone_chromosome_numbers) / len(clone_chromosome_numbers)
+                       if clone_chromosome_numbers else 46)
+    
+    # Score de complexité = somme des anomalies structurelles
+    complexity_score = (total_translocations + total_deletions + total_inversions +
+                        total_duplications + total_additions)
+    
+    # Détermination du sexe : on privilégie le type majoritaire
+    if sex_counts['xy'] > sex_counts['xx']:
+        sex = 1.0
+    elif sex_counts['xx'] > sex_counts['xy']:
+        sex = 0.0
+    else:
+        sex = 0.5
+    
+    # Calcul d'un indice de mosaicisme à partir des poids clonaux
+    # Ici, on utilise l'entropie de Shannon normalisée pour quantifier la diversité
+    if total_mitoses > 0 and len(clone_weights) > 1:
+        entropy = -sum((w / total_mitoses) * math.log(w / total_mitoses) for w in clone_weights if w > 0)
+        # Normalisation par log(num_subclones) pour obtenir une valeur entre 0 et 1
+        mosaicism_index = entropy / math.log(num_subclones) if num_subclones > 1 else 0
+    else:
+        mosaicism_index = 0
+    
+    return {
+        'num_subclones': num_subclones,
+        'sex': sex,
+        'avg_chromosomes': avg_chromosomes,
+        'total_mitoses': total_mitoses,
+        'num_translocations': total_translocations,
+        'num_deletions': total_deletions,
+        'num_inversions': total_inversions,
+        'num_duplications': total_duplications,
+        'num_additions': total_additions,
+        'num_monosomies': total_monosomies,
+        'num_trisomies': total_trisomies,
+        'complexity_score': complexity_score,
+        'complex_flag': complex_flag,
+        'mosaicism_index': mosaicism_index
+    }
+
+def parse_cytogenetics_column_v4(df, column_name='CYTOGENETICS'):
+    """
+    Applique la fonction parse_cytogenetics à chaque ligne de la colonne indiquée
+    et retourne un nouveau DataFrame comprenant les features extraites.
+    """
+    parsed_series = df[column_name].apply(parse_cytogenetics_v4)
+    parsed_df = pd.json_normalize(parsed_series)
+    final_df = pd.concat([df.drop(columns=[column_name]), parsed_df], axis=1)
+    return final_df
+
 def create_one_hot(
     df, 
     id_col='ID', 
@@ -272,13 +808,12 @@ def create_one_hot(
     pivoted = pd.crosstab(df[id_col], df[f'{ref_col.lower()}_aggreg'])
 
     # Facultatif : renommer les colonnes pour y faire apparaître "gene_"
-    pivoted.columns = [f"{ref_col.lower()}_{col}" for col in pivoted.columns]
+    pivoted.columns = [f"{ref_col.lower()}_{str(col)}" for col in pivoted.columns]
 
     # Remettre l'index (ID) comme colonne
     pivoted.reset_index(inplace=True)
 
     return pivoted
-
 
 def count_bases_per_id(df, id_col='ID', ref_col='REF'):
     """
@@ -388,7 +923,7 @@ def add_soustrac_column(df, col_soust, col_to_soust, new_col_name=None, molecula
 
     if molecular:
         # Pour les lignes valides, on calcule la soustraction
-        df[new_col_name] = df[col_to_soust] - df[col_soust]
+        df[new_col_name] = (df[col_to_soust] - df[col_soust] +1).fillna(0).astype(int)
         # On fait un groupby sur "ID" et on calcule la moyenne pour chaque ID
         df = df.groupby('ID')[new_col_name].sum().reset_index()
     else:
@@ -416,14 +951,12 @@ def log_add_one(df, col):
     """
     return np.log(df[col]+1)
 
-
 def preprocess_mutation_data(df_mutations: pd.DataFrame) -> pd.DataFrame:
     """
     df_mutations : DataFrame contenant les colonnes
         [ID, CHR, START, END, REF, ALT, GENE, PROTEIN_CHANGE, EFFECT, VAF, DEPTH]
     Retourne : Un DataFrame agrégé au niveau du patient, avec des features pour le modèle de survie.
     """
-
     # -- Étape 1 : création de variables binaires/catégorielles à partir d'EFFECT --
     df_mutations = encode_effect(df_mutations)
 
@@ -435,7 +968,7 @@ def preprocess_mutation_data(df_mutations: pd.DataFrame) -> pd.DataFrame:
     df_agg = aggregate_by_patient(df_mutations)
 
     # -- Étape 4 : (optionnel) normalisation ou filtrage si nécessaire --
-    df_agg = normalize_features(df_agg)
+    #df_agg = normalize_features(df_agg)
 
     return df_agg
 
@@ -503,11 +1036,16 @@ def aggregate_by_patient(df: pd.DataFrame) -> pd.DataFrame:
     """
 
     agg_dict = {
-        "VAF": ["mean", "max", "min", "std"],
         "is_truncating": "sum",         # nombre de variants truncants
         "is_non_synonymous": "sum",     # nombre de variants non-synonymes
-        "is_splice_site": "sum",        # ...
-        "mut_length": ["mean", "max"],  # taille moyenne d'indel, ...
+        "is_splice_site": "sum",        # nombre de variants au site de splice
+        #"GENE": "nunique",              # nombre de gènes uniques
+        #"CHR": ["sum", "mean", "min", "max"],               # nombre de chromosomes touchés 
+        #"VAF" : ["sum", "mean", "min", "max", "std", "skew"],   # VAF moyen, max, etc.
+        #"DEPTH": ["sum", "mean", "min", "max", "std", "skew"],  # profondeur moyenne, etc.
+        #"END": ["sum", "mean", "min", "max"],  # position moyenne de fin
+        "mut_length": ["sum", "mean", "max"],  # taille moyenne d'indel
+        "AA_position": ["sum", "mean", "min", "max"] # position moyenne d'aa impacté
         # etc.
     }
 
@@ -553,3 +1091,121 @@ def normalize_features(df: pd.DataFrame) -> pd.DataFrame:
     df[cols_to_scale] = scaler.fit_transform(df[cols_to_scale])
 
     return df
+
+
+def make_variant_id(row):
+    return f"chr{row['CHR']}:g.{int(row['START'])}{row['REF']}>{row['ALT']}"
+
+def extract_field(variant, field_path, default=None):
+    """
+    Parcourt le dictionnaire variant en suivant le chemin indiqué par field_path (liste de clés).
+    Retourne la valeur trouvée ou default si une clé n'est pas présente.
+    """
+    try:
+        val = variant
+        for key in field_path:
+            val = val[key]
+        return val
+    except (KeyError, TypeError):
+        return default
+    
+def process_exon_field(exon_str):
+    """
+    Traite le champ exon au format "x/y" et retourne (exon_number, total_exons, exon_ratio).
+    Si le format est incorrect, retourne (None, None, None).
+    """
+    try:
+        x, y = exon_str.split('/')
+        exon_number = int(x)
+        total_exons = int(y)
+        exon_ratio = exon_number / total_exons if total_exons != 0 else None
+        return exon_number, total_exons, exon_ratio
+    except Exception:
+        return None, None, None
+
+def add_field(variant_data, df, field_list, id_col='variant_id'):
+    """
+    Ajoute une colonne au DataFrame df en extrayant les données de variant_data
+    selon le chemin field_list. Le champ id_col est utilisé pour faire la jointure.
+    """
+    col_name = '_'.join(field_list)
+    df[col_name] = df[id_col].apply(lambda vid: extract_field(variant_data.get(vid, {}), field_list, None))
+
+    if "exon" in col_name:
+        exon_processed = df[col_name].apply(lambda x: process_exon_field(x) if x is not None else (None, None, None))
+        df[[f'{col_name}_number', f'{col_name}_total', f'{col_name}_ratio']] = pd.DataFrame(exon_processed.tolist(), index=df.index)
+
+    return df
+
+def add_myvariant_data(df: pd.DataFrame, fields_list: list) -> pd.DataFrame:
+    """
+    Enrichit le DataFrame `df` avec les données de variantes contenues dans le fichier JSON `variant_data.json`.
+    Les champs à ajouter sont spécifiés dans `fields_list`.
+    """
+    if fields_list == []:
+        return df
+
+    required_cols = ['CHR', 'START', 'REF', 'ALT']
+    
+    # Séparer les lignes valides (sans NaN dans les colonnes importantes) et les autres
+    valid_df = df.dropna(subset=required_cols).copy()
+    invalid_df = df[df[required_cols].isna().any(axis=1)].copy()
+    
+    # Calculer variant_id pour les lignes valides
+    valid_df['variant_id'] = valid_df.apply(make_variant_id, axis=1)
+    
+    # Charger les annotations MyVariant depuis le fichier JSON
+    with open('data/variant_data.json') as json_file:
+        variant_data = json.load(json_file)
+    
+    for field in fields_list:
+        valid_df = add_field(variant_data, valid_df, field)
+    
+    # Fusionner les données enrichies (valid_df) avec les lignes non traitées (invalid_df)
+    # On utilise pd.concat pour ne pas perdre les lignes où les colonnes critiques étaient manquantes
+    enriched_df = pd.concat([valid_df, invalid_df], sort=False)
+    
+    # Optionnel : vous pouvez trier le DataFrame final selon un index ou une colonne d'identifiant
+    enriched_df.reset_index(drop=True, inplace=True)
+    
+    return enriched_df
+
+
+# Fonction pour construire le modèle d'embedding
+def build_embedding_model(num_categories, embedding_dim):
+    input_cat = Input(shape=(1,), name='input_cat')
+    emb = Embedding(input_dim=num_categories, output_dim=embedding_dim, name='embedding_layer')(input_cat)
+    flat = Flatten(name='flatten')(emb)
+    model = Model(inputs=input_cat, outputs=flat)
+    return model
+
+# Fonction pour préparer les embeddings à partir d'une colonne catégorielle
+def create_embedding_features(df, id_col, ref_col, embedding_dim, min_count=0, rare_label=None):
+    df = df.copy()
+    # Comptage des occurrences
+    counts = df[ref_col].value_counts()
+    # Pour filtrer les catégories rares
+    if min_count > 0:
+        valid_categories = counts[counts >= min_count].index
+        if rare_label is not None:
+            df[ref_col] = df[ref_col].apply(lambda x: x if x in valid_categories else rare_label)
+            # Recalculer après remplacement
+            counts = df[ref_col].value_counts()
+            valid_categories = counts.index
+    # Créer le mapping catégorie -> indice
+    unique_categories = df[ref_col].unique()
+    cat_to_idx = {cat: idx for idx, cat in enumerate(unique_categories)}
+    df['cat_idx'] = df[ref_col].map(cat_to_idx)
+    num_categories = len(unique_categories)
+    
+    # Construire le modèle d'embedding
+    emb_model = build_embedding_model(num_categories, embedding_dim)
+    # Ici, on n'entraîne pas le modèle (les poids restent aléatoires) – dans un vrai pipeline, vous pouvez l'entraîner
+    # Obtenir l'embedding pour chaque ligne
+    embeddings = emb_model.predict(df['cat_idx'].values.reshape(-1, 1))
+    
+    # Construire un DataFrame à partir des embeddings
+    emb_cols = [f"{ref_col}_emb_{i}" for i in range(embedding_dim)]
+    df_emb = pd.DataFrame(embeddings, columns=emb_cols, index=df[id_col])
+    
+    return df_emb

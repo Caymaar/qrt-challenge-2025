@@ -2,6 +2,7 @@ import pandas as pd
 import featuretools as ft
 from sksurv.util import Surv
 from datetime import datetime
+from sksurv.metrics import concordance_index_ipcw
 
 def load_target():
     target_df = pd.read_csv("data/target_train.csv")
@@ -11,41 +12,7 @@ def load_target():
 
     return target_df
 
-def create_entity():
-
-    clinical_train = pd.read_csv("data/X_train/clinical_train.csv")
-    molecular_train = pd.read_csv("data/X_train/molecular_train.csv")
-
-    clinical_test = pd.read_csv("data/X_test/clinical_test.csv")
-    molecular_test = pd.read_csv("data/X_test/molecular_test.csv")
-
-    clinical = pd.concat([clinical_train, clinical_test]).reset_index(drop=True)
-    molecular = pd.concat([molecular_train, molecular_test]).reset_index(drop=True)
-
-    es = ft.EntitySet(id="data")
-
-    es = es.add_dataframe(
-        dataframe_name='clinical',
-        dataframe=clinical,
-        index='ID' 
-    )
-
-    es = es.add_dataframe(
-        dataframe_name='molecular',
-        dataframe=molecular,
-        index='index'   
-    )
-
-    es.add_relationship(
-        parent_dataframe_name='clinical',
-        parent_column_name='ID',
-        child_dataframe_name='molecular',
-        child_column_name='ID'
-    )
-
-    return es
-
-def split_data(X_data):
+def split_data(X_data, reverse=False):
 
     df_eval = pd.read_csv("data/X_test/clinical_test.csv")
     X_eval = X_data.loc[X_data.index.isin(df_eval['ID'])]
@@ -57,9 +24,30 @@ def split_data(X_data):
 
     #Rename columns of target
     target.rename(columns={'OS_STATUS': 'event', 'OS_YEARS': 'time'}, inplace=True)
-    y = Surv.from_dataframe('event', 'time', target)
+    
 
+    if reverse:
+        y = Surv.from_dataframe('time', 'event', target)
+    else:
+        y = Surv.from_dataframe('event', 'time', target)
     return X_data, X_eval, y
+
+def get_method_name(key, params, model=False):
+    if key not in params:
+        return ""
+    if model:
+        return str(key) + "_" + "_".join([str(params[key][param]) for param in params[key].keys()])
+    if isinstance(params[key], list):
+        return str(key) + "_" + "_".join(params[key]).replace("/", "divby")
+    else:
+        return str(key) + "_" + str(params[key])
+    
+def score_method(model, X_train, X_test, y_train, y_test, reverse=False):
+    cindex_train = concordance_index_ipcw(y_train, y_train, model.predict(X_train) if not reverse else -model.predict(X_train), tau=7)[0]
+    cindex_test = concordance_index_ipcw(y_train, y_test, model.predict(X_test) if not reverse else -model.predict(X_test), tau=7)[0]
+    print(f"{model.__class__.__name__} Model Concordance Index IPCW on train: {cindex_train:.3f}")
+    print(f"{model.__class__.__name__} Model Concordance Index IPCW on test: {cindex_test:.3f}")
+    return f"score_{cindex_train:.3f}_{cindex_test:.3f}"
 
 def predict_and_save(X_eval, model, method="featuretools"):
     df_eval = pd.read_csv("data/X_test/clinical_test.csv")
