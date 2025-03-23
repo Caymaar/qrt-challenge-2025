@@ -9,10 +9,21 @@ wheels/
 .ruff_cache/
 
 
-# Virtual environments
-.venv
+# Python virtual environment
+.venv/
 
-# Big files
-*.bed
-*.bb
+# Archive directory
 archive/
+
+# Report directories
+report/eda/*
+report/shap/*
+
+# Keep .gitkeep files to maintain directory structure
+!report/eda/.gitkeep
+!report/shap/.gitkeep
+
+# Python-specific ignores
+__pycache__/
+*.py[cod]
+.pytest_cache/

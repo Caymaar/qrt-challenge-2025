@@ -97,28 +97,57 @@ class ShapReport:
         fig_dot = plt.gcf()
         plots['summary_dot'] = self._fig_to_base64(fig_dot)
 
-        # 3. Dependence Plots pour les 5 meilleures variables
-        # On sélectionne les 5 variables dont la moyenne des valeurs absolues de SHAP est la plus élevée.
+        # 3. Dependence Plots pour les variables les plus importantes
         mean_abs_shap = np.abs(self.shap_values.values).mean(axis=0)
-        # On trie les indices par ordre décroissant
         top_feature_indices = np.argsort(mean_abs_shap)[::-1][:10]
         top_features = self.X_train.columns[top_feature_indices]
 
-        # Dictionnaire pour stocker les images encodées des dependence plots
         for feature in top_features:
             plt.figure()
             shap.dependence_plot(feature, self.shap_values.values, self.X_train, show=False)
             fig_dep = plt.gcf()
-            # On enregistre l'image dans le dictionnaire en utilisant le nom de la feature comme clé
             plots[f'dependence_{feature}'] = self._fig_to_base64(fig_dep)
 
-        # Création du template HTML final avec trois colonnes
+        # 4. (NOUVEAU) Feature Importances du modèle s'il en dispose
+        feature_importances_html = ""
+        if hasattr(self.model, "feature_importances_"):
+            importances = self.model.feature_importances_
+
+            # On crée un bar plot horizontal pour illustrer les importances
+            # --> Augmentation de la taille de la figure
+            plt.figure(figsize=(25, 8))  # Ajustez selon vos préférences (largeur x hauteur)
+            sorted_idx = np.argsort(importances)
+
+            plt.barh(range(len(importances)), importances[sorted_idx], align='center')
+            plt.yticks(range(len(importances)), self.X_train.columns[sorted_idx])
+            plt.xlabel("Feature Importance")
+            plt.title("Feature Importances (Model-based)")
+
+            # --> Ajustement automatique des marges
+            plt.tight_layout()
+
+            fig_fi = plt.gcf()
+
+            # On l'enregistre en base64
+            plots['model_feature_importances'] = self._fig_to_base64(fig_fi)
+
+            # On prépare le HTML associé
+            feature_importances_html = f"""
+            <div class="plot">
+                <h2>Feature Importances (Model-based)</h2>
+                <img src="data:image/png;base64,{plots['model_feature_importances']}" 
+                    alt="Feature Importances du modèle">
+            </div>
+            """
+
+        # Création du template HTML final avec trois colonnes (et une section optionnelle)
         dependence_plots_html = ""
         for feature in top_features:
             dependence_plots_html += f"""
                 <div class="plot">
                     <h2>Dependence Plot pour la variable : {feature}</h2>
-                    <img src="data:image/png;base64,{plots['dependence_' + feature]}" alt="Dependence Plot pour {feature}">
+                    <img src="data:image/png;base64,{plots['dependence_' + feature]}" 
+                        alt="Dependence Plot pour {feature}">
                 </div>
             """
 
@@ -168,6 +197,7 @@ class ShapReport:
                         <h2>Summary Plot (Bar)</h2>
                         <img src="data:image/png;base64,{plots['summary_bar']}" alt="Summary Plot Bar">
                     </div>
+                    {feature_importances_html}
                 </div>
                 <!-- Colonne 2 : Summary Plot (Dot) -->
                 <div class="column">
@@ -238,7 +268,7 @@ class EDAReport:
             "kde_plots.html": {"title": "KDE PLOTS", "width": "100%", "height": "400"},
         }
 
-    def generate_report(self):
+    def generate_report(self, max_rows=150000, max_cols=30):
         """
         Génère le rapport EDA en exécutant AutoViz pour chaque variable cible, puis
         combine les graphiques générés dans un fichier HTML unique avec un en-tête pour chaque variable.
@@ -264,8 +294,8 @@ class EDAReport:
                 header=self.header,
                 lowess=self.lowess,
                 chart_format=self.chart_format,
-                max_rows_analyzed=min([self.df.shape[0], 10**5]),
-                max_cols_analyzed=min([self.df.shape[1], 50]),
+                max_rows_analyzed=min(self.df.shape[0], max_rows),
+                max_cols_analyzed=min(self.df.shape[1], max_cols),
                 save_plot_dir=str(save_dir),
                 verbose=self.verbose
             )

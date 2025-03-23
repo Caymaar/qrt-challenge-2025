@@ -7,6 +7,36 @@ import json
 import math
 from tensorflow.keras.layers import Input, Embedding, Flatten
 from tensorflow.keras.models import Model
+from sklearn.ensemble import BaggingClassifier
+from sklearn.tree import DecisionTreeClassifier
+
+def process_outliers(df, threshold, multiplier=1.5):
+    """
+    Traite les outliers d'un DataFrame en les limitant (winsorizing) selon la méthode IQR.
+    
+    Pour chaque colonne numérique, on calcule le premier (Q1) et le troisième (Q3) quartile,
+    puis on détermine l'intervalle acceptable [Q1 - multiplier * IQR, Q3 + multiplier * IQR].
+    Les valeurs en dehors de cet intervalle sont remplacées par la valeur limite correspondante.
+    
+    Parameters:
+        df (pd.DataFrame): Le DataFrame à traiter.
+        multiplier (float): Le facteur multiplicateur pour l'IQR (par défaut 1.5).
+        
+    Returns:
+        pd.DataFrame: Le DataFrame avec les outliers traités.
+    """
+    df_out = df.copy()
+    numeric_cols = df_out.select_dtypes(include=[np.number]).columns
+    for col in numeric_cols:
+        Q1 = df_out[col].quantile(threshold)
+        Q3 = df_out[col].quantile(1-threshold)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - multiplier * IQR
+        upper_bound = Q3 + multiplier * IQR
+        # Limiter (clip) les valeurs en dehors de l'intervalle
+        df_out[col] = df_out[col].clip(lower_bound, upper_bound)
+        print("Outliers removed for column:", col)
+    return df_out
 
 def create_entity(params):
 
@@ -158,6 +188,8 @@ def main_preprocess(data, params):
 
     X = process_categories(X, method="del")
 
+    if 'outliers' in params:
+        X = process_outliers(X, **params['outliers'])
     return X
 
 def process_categories(df, method="del"):
@@ -169,13 +201,67 @@ def process_categories(df, method="del"):
     if method == "dummies":
         return pd.get_dummies(df, columns=categorical_columns)
 
-def process_missing_values(X_train, X_test, X_eval, method="impute", strategy="median"):
-    if method == "del":
-        return X_train.dropna(), X_test.dropna(), X_eval.dropna()
+def to_df(df_list, columns):
+    return (pd.DataFrame(df_list[i], columns=columns) for i in range(len(df_list)))
+
+def impute_sex(X_train, X_test, X_eval, columns):
+
+    X_train, X_test, X_eval = to_df([X_train, X_test, X_eval], columns)
+    """
+    Impute les valeurs inconnues (0.5) de la colonne 'sex' dans X_train, X_test et X_eval
+    en entraînant un modèle de bagging sur les observations dont le sexe est connu (0 ou 1).
     
-    if method == "impute":
-        imputer = SimpleImputer(strategy=strategy)
-        return imputer.fit_transform(X_train), imputer.transform(X_test), imputer.transform(X_eval)
+    Parameters:
+        X_train, X_test, X_eval (pd.DataFrame): DataFrames déjà imputés pour les autres variables.
+    
+    Returns:
+        tuple: (X_train, X_test, X_eval) mis à jour avec la colonne 'sex' imputée.
+    """
+    # On agrège temporairement les trois datasets pour disposer d'un ensemble complet
+    temp = pd.concat([X_train, X_test, X_eval], axis=0)
+    
+    # Sélectionner les observations où le sexe est connu (0 ou 1)
+    known = temp[temp["sex"] != 0.5]
+    
+    # Si aucune donnée connue n'est présente, on retourne simplement les datasets originaux
+    if known.empty:
+        return X_train, X_test, X_eval
+
+    # Préparer les données d'entraînement pour prédire 'sex'
+    X_model = known.drop(columns=["sex"])
+    y_model = known["sex"]
+    
+    # Création du modèle de bagging avec 500 estimateurs et l'estimateur de base: DecisionTreeClassifier
+    model = BaggingClassifier(
+        estimator=DecisionTreeClassifier(),
+        n_estimators=500,
+        oob_score=True,
+        random_state=42
+    )
+    model.fit(X_model, y_model)
+    print("OOB Score :", model.oob_score_)
+    
+    # Pour chaque dataset, prédire et mettre à jour les valeurs de 'sex' là où elles sont 0.5
+    for dataset in [X_train, X_test, X_eval]:
+        mask = dataset["sex"] == 0.5
+        if mask.any():
+            X_features = dataset.loc[mask].drop(columns=["sex"])
+            preds = model.predict(X_features)
+            dataset.loc[mask, "sex"] = preds
+
+    return X_train.to_numpy(), X_test.to_numpy(), X_eval.to_numpy()
+
+def process_missing_values(X_train, X_test, X_eval, columns, strategy="median", sex=False):
+
+    
+
+    imputer = SimpleImputer(strategy=strategy)
+    X_train, X_test, X_eval = imputer.fit_transform(X_train), imputer.transform(X_test), imputer.transform(X_eval)
+
+    if sex:
+        return impute_sex(X_train, X_test, X_eval, columns)
+    else:
+        return X_train, X_test, X_eval
 
 def parse_cytogenetics(cyto_str):
     """
